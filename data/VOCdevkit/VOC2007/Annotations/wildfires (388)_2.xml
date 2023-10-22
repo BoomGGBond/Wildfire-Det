@@ -1,0 +1,39 @@
+<annotation>
+	<folder>VOC2012</folder>
+	<filename>wildfires (388)_2.jpg</filename>
+	<source>
+		<database>The VOC2012 Database</database>
+		<annotation>PASCAL VOC2012</annotation>
+		<image>flickr</image>
+	</source>
+	<size>
+		<width>640</width>
+		<height>355</height>
+		<depth>3</depth>
+	</size>
+	<segmented>1</segmented>
+	<object>
+		<name>fire</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>134</xmin>
+			<ymin>54</ymin>
+			<xmax>325</xmax>
+			<ymax>186</ymax>
+		</bndbox>
+	</object>
+	<object>
+		<name>fire</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>479</xmin>
+			<ymin>157</ymin>
+			<xmax>577</xmax>
+			<ymax>220</ymax>
+		</bndbox>
+	</object>
+</annotation>
