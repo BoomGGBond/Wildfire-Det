@@ -1,13 +1,134 @@
 import os
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import trunc_normal_, DropPath
+from timm.models.registry import register_model
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from .feature_pyramid_network import BackboneWithFPN, LastLevelMaxPool
 
 
-class Bottleneck(nn.Module):
+class CA(nn.Module):
+    def __init__(self, channel, ratio=8):
+        super(CA, self).__init__()
+        self.channel = channel
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(self.channel, self.channel // ratio, True),
+            nn.ReLU(),
+            nn.Linear(self.channel // ratio, self.channel, True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, w, h = x.size()
+        inputs = x
+        avg_ = self.avg_pool(x).view([b, c])
+        max_ = self.max_pool(x).view([b, c])
+
+        avg_fc_ = self.fc(avg_).view([b, c, 1, 1])
+        max_fc_ = self.fc(max_).view([b, c, 1, 1])
+
+        output = avg_fc_ + max_fc_
+
+        return output * inputs
+
+
+class SA(nn.Module):
+    def __init__(self, kernel_size=3):
+        super(SA, self).__init__()
+        assert kernel_size in (3, 7, 15, 27, 31)
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        inputs = x
+        avg_pool = torch.mean(x, dim=1, keepdim=True)
+        max_pool, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_pool, max_pool], dim=1)
+        x = self.conv1(x)
+        return inputs * self.sigmoid(x)
+
+
+class SENET(nn.Module):
+    def __init__(self, channel, ratio=16):
+        super(SENET, self).__init__()
+        self.channel = channel
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 定义全局平均池化层，结果为[b, a, 1, 1] b表示batchsize, c表示通道数
+        # 定义全连接层
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // ratio, True),
+            nn.ReLU(),
+            nn.Linear(channel // ratio, channel, True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, w, h = x.size()
+        inputs = x
+
+        inpust_avg = self.avg_pool(x).view([b, c])
+
+        inputs_fc = self.fc(inpust_avg).view([b, c, 1, 1])
+
+        return inputs_fc * inputs
+
+
+class ECANET(nn.Module):
+    def __init__(self, channel, b=1, gamma=2):
+        super(ECANET, self).__init__()
+        self.channel = channel
+
+        kernel_size = int(abs((math.log(channel, 2) + b) / gamma))
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        padding = (kernel_size - 1) // 2
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=padding, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv1d(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+
+        return x * y.expand_as(x)
+
+
+class CASA(nn.Module):
+    def __init__(self, channel):
+        super(CASA, self).__init__()
+        self.CA = CA(channel, ratio=16)
+        self.SA = SA(kernel_size=7)
+
+    def forward(self, x):
+        inputs = x
+        ca_x = self.CA(x)
+        output = ca_x * inputs
+        sa_x = self.SA(output)
+        output_ = sa_x * output
+
+        return output_
+
+
+class Block(nn.Module):
+    r""" ConvNeXt Block. There are two equivalent implementations:
+    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
+    (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
+    We use (2) as we find it slightly faster in PyTorch
+
+    Args:
+        dim (int): Number of input channels.
+        drop_path (float): Stochastic depth rate. Default: 0.0
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+    """
 
     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
         super().__init__()
@@ -81,9 +202,26 @@ class ConvNeXt(nn.Module):
 
     def __init__(self, in_chans=3, num_classes=1000,
                  depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0.,
-                 layer_scale_init_value=1e-6, head_init_scale=1.,
+                 layer_scale_init_value=1e-6, head_init_scale=1., aa="ca"
                  ):
         super().__init__()
+        if aa == "ca":
+            print("====> based on Channel Attention!")
+            self.AA = CA(channel=dims[-1])
+        elif aa == "sa":
+            print("====> based on Spatial Attention!")
+            self.AA = SA(kernel_size=3)
+        elif aa == "senet":
+            print("====> based on SENet!")
+            self.AA = SENET(channel=dims[-1])
+        elif aa == "ecanet":
+            print("====> based on ECANet!")
+            self.AA = ECANET(channel=dims[-1])
+        elif aa == "casa":
+            print("====> based on Channel Attention and Spatial Attention!")
+            self.AA = CASA(channel=dims[-1])
+        else:
+            raise ValueError
 
         self.downsample_layers = nn.ModuleList()  # stem and 3 intermediate downsampling conv layers
         stem = nn.Sequential(
@@ -130,6 +268,7 @@ class ConvNeXt(nn.Module):
 
     def forward(self, x):
         x = self.forward_features(x)
+        x = x + self.AA(x)
         x = self.norm(x.mean([-2, -1]))
         x = self.head(x)
         return x
@@ -190,7 +329,7 @@ def convnext_fpn_backbone(pretrain_path="",
     Returns:
 
     """
-    convnext_backbone = ConvNeXt(Bottleneck, [3, 3, 9, 3],
+    convnext_backbone = ConvNeXt(Block, [3, 3, 9, 3],
                              include_top=False,
                              norm_layer=norm_layer)
 
